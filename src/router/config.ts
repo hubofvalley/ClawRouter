@@ -623,8 +623,8 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
     // Tier boundaries on weighted score axis
     tierBoundaries: {
       simpleMedium: 0.0,
-      mediumComplex: 0.18,
-      complexReasoning: 0.4, // Raised from 0.25 - requires strong reasoning signals
+      mediumComplex: 0.3, // Raised from 0.18 - prevent simple tasks from reaching expensive COMPLEX tier
+      complexReasoning: 0.5, // Raised from 0.4 - reserve for true reasoning tasks
     },
 
     // Sigmoid steepness for confidence calibration
@@ -633,35 +633,101 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
     confidenceThreshold: 0.7,
   },
 
+  // Auto (balanced) tier configs - current default smart routing
   tiers: {
     SIMPLE: {
-      primary: "nvidia/kimi-k2.5", // Ultra-cheap $0.001/$0.001
+      primary: "moonshot/kimi-k2.5", // $0.50/$2.40 - best quality/price for simple tasks
       fallback: [
-        "google/gemini-2.5-flash",
-        "nvidia/gpt-oss-120b",
-        "nvidia/gpt-oss-20b",
+        "google/gemini-2.5-flash", // 1M context, cost-effective
+        "nvidia/gpt-oss-120b", // FREE fallback
         "deepseek/deepseek-chat",
       ],
     },
     MEDIUM: {
       primary: "xai/grok-code-fast-1", // Code specialist, $0.20/$1.50
       fallback: [
-        "xai/grok-4-1-fast-non-reasoning", // Upgraded Grok 4.1
+        "google/gemini-2.5-flash", // 1M context, cost-effective
         "deepseek/deepseek-chat",
-        "google/gemini-2.5-flash",
+        "xai/grok-4-1-fast-non-reasoning", // Upgraded Grok 4.1
       ],
     },
     COMPLEX: {
-      primary: "google/gemini-2.5-pro",
-      fallback: ["openai/gpt-5.2", "anthropic/claude-sonnet-4", "xai/grok-4-0709", "openai/gpt-4o"],
+      primary: "google/gemini-3-pro-preview", // Latest Gemini - upgraded from 2.5
+      fallback: [
+        "google/gemini-2.5-flash", // CRITICAL: 1M context, cheap failsafe before expensive models
+        "google/gemini-2.5-pro",
+        "deepseek/deepseek-chat", // Another cheap option
+        "xai/grok-4-0709",
+        "openai/gpt-4o",
+        "openai/gpt-5.2",
+        "anthropic/claude-sonnet-4",
+      ],
     },
     REASONING: {
       primary: "xai/grok-4-1-fast-reasoning", // Upgraded Grok 4.1 reasoning $0.20/$0.50
       fallback: [
+        "deepseek/deepseek-reasoner", // Cheap reasoning model as first fallback
         "xai/grok-4-fast-reasoning",
-        "openai/o3", // Strong reasoning model
-        "deepseek/deepseek-reasoner",
+        "openai/o3",
+        "openai/o4-mini", // Latest o-series mini
         "moonshot/kimi-k2.5",
+      ],
+    },
+  },
+
+  // Eco tier configs - ultra cost-optimized (blockrun/eco)
+  ecoTiers: {
+    SIMPLE: {
+      primary: "moonshot/kimi-k2.5", // $0.50/$2.40
+      fallback: ["nvidia/gpt-oss-120b", "deepseek/deepseek-chat", "google/gemini-2.5-flash"],
+    },
+    MEDIUM: {
+      primary: "deepseek/deepseek-chat", // $0.14/$0.28
+      fallback: ["xai/grok-code-fast-1", "google/gemini-2.5-flash", "moonshot/kimi-k2.5"],
+    },
+    COMPLEX: {
+      primary: "xai/grok-4-0709", // $0.20/$1.50
+      fallback: ["deepseek/deepseek-chat", "google/gemini-2.5-flash", "openai/gpt-4o-mini"],
+    },
+    REASONING: {
+      primary: "deepseek/deepseek-reasoner", // $0.55/$2.19
+      fallback: ["xai/grok-4-fast-reasoning", "moonshot/kimi-k2.5"],
+    },
+  },
+
+  // Premium tier configs - best quality (blockrun/premium)
+  // codex=complex coding, kimi=simple coding, sonnet=reasoning/instructions, opus=architecture/PM/audits
+  premiumTiers: {
+    SIMPLE: {
+      primary: "moonshot/kimi-k2.5", // $0.50/$2.40 - good for simple coding
+      fallback: ["anthropic/claude-haiku-4.5", "google/gemini-2.5-flash", "xai/grok-code-fast-1"],
+    },
+    MEDIUM: {
+      primary: "anthropic/claude-sonnet-4", // $3/$15 - reasoning/instructions
+      fallback: [
+        "openai/gpt-5.2-codex",
+        "moonshot/kimi-k2.5",
+        "google/gemini-2.5-pro",
+        "xai/grok-4-0709",
+      ],
+    },
+    COMPLEX: {
+      primary: "openai/gpt-5.2-codex", // $2.50/$10 - complex coding (78% cost savings vs Opus)
+      fallback: [
+        "anthropic/claude-opus-4.6",
+        "anthropic/claude-opus-4.5",
+        "anthropic/claude-sonnet-4",
+        "google/gemini-3-pro-preview",
+        "moonshot/kimi-k2.5",
+      ],
+    },
+    REASONING: {
+      primary: "anthropic/claude-sonnet-4", // $3/$15 - best for reasoning/instructions
+      fallback: [
+        "anthropic/claude-opus-4.6",
+        "anthropic/claude-opus-4.5",
+        "openai/o3",
+        "xai/grok-4-1-fast-reasoning",
       ],
     },
   },
@@ -682,11 +748,21 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
     },
     COMPLEX: {
       primary: "anthropic/claude-sonnet-4",
-      fallback: ["anthropic/claude-opus-4.5", "openai/gpt-5.2", "xai/grok-4-0709"], // Opus 4.5 is 3x cheaper than Opus 4
+      fallback: [
+        "anthropic/claude-opus-4.6", // Latest Opus - best agentic
+        "openai/gpt-5.2",
+        "google/gemini-3-pro-preview",
+        "xai/grok-4-0709",
+      ],
     },
     REASONING: {
       primary: "anthropic/claude-sonnet-4", // Strong tool use + reasoning for agentic tasks
-      fallback: ["xai/grok-4-fast-reasoning", "moonshot/kimi-k2.5", "deepseek/deepseek-reasoner"],
+      fallback: [
+        "anthropic/claude-opus-4.6",
+        "xai/grok-4-fast-reasoning",
+        "moonshot/kimi-k2.5",
+        "deepseek/deepseek-reasoner",
+      ],
     },
   },
 

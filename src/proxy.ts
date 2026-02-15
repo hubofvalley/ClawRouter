@@ -47,21 +47,34 @@ import { logUsage, type UsageEntry } from "./logger.js";
 import { getStats } from "./stats.js";
 import { RequestDeduplicator } from "./dedup.js";
 import { BalanceMonitor } from "./balance.js";
+import { compressContext, shouldCompress, type NormalizedMessage } from "./compression/index.js";
 // Error classes available for programmatic use but not used in proxy
 // (universal free fallback means we don't throw balance errors anymore)
 // import { InsufficientFundsError, EmptyWalletError } from "./errors.js";
 import { USER_AGENT } from "./version.js";
 import { SessionStore, getSessionId, type SessionConfig } from "./session.js";
 import { checkForUpdates } from "./updater.js";
+import { PROXY_PORT } from "./config.js";
 
 const BLOCKRUN_API = "https://blockrun.ai/api";
+// Routing profile models - virtual models that trigger intelligent routing
 const AUTO_MODEL = "blockrun/auto";
-const AUTO_MODEL_SHORT = "auto"; // OpenClaw strips provider prefix
+
+const ROUTING_PROFILES = new Set([
+  "blockrun/free",
+  "free",
+  "blockrun/eco",
+  "eco",
+  "blockrun/auto",
+  "auto",
+  "blockrun/premium",
+  "premium",
+]);
 const FREE_MODEL = "nvidia/gpt-oss-120b"; // Free model for empty wallet fallback
+const MAX_MESSAGES = 200; // BlockRun API limit - truncate older messages if exceeded
 const HEARTBEAT_INTERVAL_MS = 2_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 180_000; // 3 minutes (allows for on-chain tx + LLM response)
-const DEFAULT_PORT = 8402;
-const MAX_FALLBACK_ATTEMPTS = 3; // Maximum models to try in fallback chain
+const MAX_FALLBACK_ATTEMPTS = 5; // Maximum models to try in fallback chain (increased from 3 to ensure cheap models are tried)
 const HEALTH_CHECK_TIMEOUT_MS = 2_000; // Timeout for checking existing proxy
 const RATE_LIMIT_COOLDOWN_MS = 60_000; // 60 seconds cooldown for rate-limited models
 const PORT_RETRY_ATTEMPTS = 5; // Max attempts to bind port (handles TIME_WAIT)
@@ -231,17 +244,11 @@ function safeWrite(res: ServerResponse, data: string | Buffer): boolean {
 const BALANCE_CHECK_BUFFER = 1.5;
 
 /**
- * Get the proxy port from environment variable or default.
+ * Get the proxy port from pre-loaded configuration.
+ * Port is validated at module load time, this just returns the cached value.
  */
 export function getProxyPort(): number {
-  const envPort = process.env.BLOCKRUN_PROXY_PORT;
-  if (envPort) {
-    const parsed = parseInt(envPort, 10);
-    if (!isNaN(parsed) && parsed > 0 && parsed < 65536) {
-      return parsed;
-    }
-  }
-  return DEFAULT_PORT;
+  return PROXY_PORT;
 }
 
 /**
@@ -289,6 +296,9 @@ const PROVIDER_ERROR_PATTERNS = [
   /temporarily.*unavailable/i,
   /api.*key.*invalid/i,
   /authentication.*failed/i,
+  /request too large/i,
+  /request.*size.*exceeds/i,
+  /payload too large/i,
 ];
 
 /**
@@ -299,6 +309,7 @@ const FALLBACK_STATUS_CODES = [
   401, // Unauthorized - provider API key issues
   402, // Payment required - but from upstream, not x402
   403, // Forbidden - provider restrictions
+  413, // Payload too large - request exceeds model's context limit
   429, // Rate limited
   500, // Internal server error
   502, // Bad gateway
@@ -582,6 +593,28 @@ function normalizeMessagesForThinking(messages: ExtendedChatMessage[]): Extended
   return hasChanges ? normalized : messages;
 }
 
+/**
+ * Truncate messages to stay under BlockRun's MAX_MESSAGES limit.
+ * Keeps all system messages and the most recent conversation history.
+ */
+function truncateMessages<T extends { role: string }>(messages: T[]): T[] {
+  if (!messages || messages.length <= MAX_MESSAGES) return messages;
+
+  // Separate system messages from conversation
+  const systemMsgs = messages.filter((m) => m.role === "system");
+  const conversationMsgs = messages.filter((m) => m.role !== "system");
+
+  // Keep all system messages + most recent conversation messages
+  const maxConversation = MAX_MESSAGES - systemMsgs.length;
+  const truncatedConversation = conversationMsgs.slice(-maxConversation);
+
+  console.log(
+    `[ClawRouter] Truncated messages: ${messages.length} → ${systemMsgs.length + truncatedConversation.length} (kept ${systemMsgs.length} system + ${truncatedConversation.length} recent)`,
+  );
+
+  return [...systemMsgs, ...truncatedConversation];
+}
+
 // Kimi/Moonshot models use special Unicode tokens for thinking boundaries.
 // Pattern: <｜begin▁of▁thinking｜>content<｜end▁of▁thinking｜>
 // The ｜ is fullwidth vertical bar (U+FF5C), ▁ is lower one-eighth block (U+2581).
@@ -647,6 +680,19 @@ export type ProxyOptions = {
    * across requests within a session to prevent mid-task model switching.
    */
   sessionConfig?: Partial<SessionConfig>;
+  /**
+   * Auto-compress large requests to reduce network usage.
+   * When enabled, requests are automatically compressed using
+   * LLM-safe context compression (15-40% reduction).
+   * Default: true
+   */
+  autoCompressRequests?: boolean;
+  /**
+   * Threshold in KB to trigger auto-compression (default: 180).
+   * Requests larger than this are compressed before sending.
+   * Set to 0 to compress all requests.
+   */
+  compressionThresholdKB?: number;
   onReady?: (port: number) => void;
   onError?: (error: Error) => void;
   onPayment?: (info: { model: string; amount: string; network: string }) => void;
@@ -1121,6 +1167,11 @@ async function tryModelRequest(
       parsed.messages = normalizeMessageRoles(parsed.messages as ChatMessage[]);
     }
 
+    // Truncate messages to stay under BlockRun's limit (200 messages)
+    if (Array.isArray(parsed.messages)) {
+      parsed.messages = truncateMessages(parsed.messages as ChatMessage[]);
+    }
+
     // Sanitize tool IDs to match Anthropic's pattern (alphanumeric, underscore, hyphen only)
     if (Array.isArray(parsed.messages)) {
       parsed.messages = sanitizeToolIds(parsed.messages as ChatMessage[]);
@@ -1231,6 +1282,7 @@ async function proxyRequest(
   let isStreaming = false;
   let modelId = "";
   let maxTokens = 4096;
+  let routingProfile: "free" | "eco" | "auto" | "premium" | null = null;
   const isChatCompletion = req.url?.includes("/chat/completions");
 
   if (isChatCompletion && body.length > 0) {
@@ -1256,83 +1308,114 @@ async function proxyRequest(
       const resolvedModel = resolveModelAlias(normalizedModel);
       const wasAlias = resolvedModel !== normalizedModel;
 
-      const isAutoModel =
-        normalizedModel === AUTO_MODEL.toLowerCase() ||
-        normalizedModel === AUTO_MODEL_SHORT.toLowerCase();
+      const isRoutingProfile = ROUTING_PROFILES.has(normalizedModel);
+
+      // Extract routing profile type (free/eco/auto/premium)
+      if (isRoutingProfile) {
+        const profileName = normalizedModel.replace("blockrun/", "");
+        routingProfile = profileName as "free" | "eco" | "auto" | "premium";
+      }
 
       // Debug: log received model name
       console.log(
-        `[ClawRouter] Received model: "${parsed.model}" -> normalized: "${normalizedModel}"${wasAlias ? ` -> alias: "${resolvedModel}"` : ""}, isAuto: ${isAutoModel}`,
+        `[ClawRouter] Received model: "${parsed.model}" -> normalized: "${normalizedModel}"${wasAlias ? ` -> alias: "${resolvedModel}"` : ""}${routingProfile ? `, profile: ${routingProfile}` : ""}`,
       );
 
       // If alias was resolved, update the model in the request
-      if (wasAlias && !isAutoModel) {
+      if (wasAlias && !isRoutingProfile) {
         parsed.model = resolvedModel;
         modelId = resolvedModel;
         bodyModified = true;
       }
 
-      if (isAutoModel) {
-        // Check for session persistence - use pinned model if available
-        const sessionId = getSessionId(
-          req.headers as Record<string, string | string[] | undefined>,
-        );
-        const existingSession = sessionId ? sessionStore.getSession(sessionId) : undefined;
-
-        if (existingSession) {
-          // Use the session's pinned model instead of re-routing
-          console.log(
-            `[ClawRouter] Session ${sessionId?.slice(0, 8)}... using pinned model: ${existingSession.model}`,
-          );
-          parsed.model = existingSession.model;
-          modelId = existingSession.model;
+      // Handle routing profiles (free/eco/auto/premium)
+      if (isRoutingProfile) {
+        // Free profile - direct shortcut to nvidia/gpt-oss-120b (no tier routing)
+        if (routingProfile === "free") {
+          const freeModel = "nvidia/gpt-oss-120b";
+          console.log(`[ClawRouter] Free profile - using ${freeModel} directly`);
+          parsed.model = freeModel;
+          modelId = freeModel;
           bodyModified = true;
-          sessionStore.touchSession(sessionId!);
+
+          // Log usage for free profile
+          await logUsage({
+            timestamp: new Date().toISOString(),
+            model: freeModel,
+            tier: "SIMPLE",
+            cost: 0,
+            baselineCost: 0,
+            savings: 1.0, // 100% savings
+            latencyMs: 0,
+          });
         } else {
-          // No session or expired - route normally
-          // Extract prompt from messages
-          type ChatMessage = { role: string; content: string };
-          const messages = parsed.messages as ChatMessage[] | undefined;
-          let lastUserMsg: ChatMessage | undefined;
-          if (messages) {
-            for (let i = messages.length - 1; i >= 0; i--) {
-              if (messages[i].role === "user") {
-                lastUserMsg = messages[i];
-                break;
+          // eco/auto/premium - use tier routing
+          // Check for session persistence - use pinned model if available
+          const sessionId = getSessionId(
+            req.headers as Record<string, string | string[] | undefined>,
+          );
+          const existingSession = sessionId ? sessionStore.getSession(sessionId) : undefined;
+
+          if (existingSession) {
+            // Use the session's pinned model instead of re-routing
+            console.log(
+              `[ClawRouter] Session ${sessionId?.slice(0, 8)}... using pinned model: ${existingSession.model}`,
+            );
+            parsed.model = existingSession.model;
+            modelId = existingSession.model;
+            bodyModified = true;
+            sessionStore.touchSession(sessionId!);
+          } else {
+            // No session or expired - route normally
+            // Extract prompt from messages
+            type ChatMessage = { role: string; content: string };
+            const messages = parsed.messages as ChatMessage[] | undefined;
+            let lastUserMsg: ChatMessage | undefined;
+            if (messages) {
+              for (let i = messages.length - 1; i >= 0; i--) {
+                if (messages[i].role === "user") {
+                  lastUserMsg = messages[i];
+                  break;
+                }
               }
             }
+            const systemMsg = messages?.find((m: ChatMessage) => m.role === "system");
+            const prompt = typeof lastUserMsg?.content === "string" ? lastUserMsg.content : "";
+            const systemPrompt =
+              typeof systemMsg?.content === "string" ? systemMsg.content : undefined;
+
+            // Tool detection no longer forces agentic mode
+            // Agentic mode is now triggered by keyword-based detection (agenticScore >= 0.6)
+            // This allows simple queries with tools to use cheaper models
+            const tools = parsed.tools as unknown[] | undefined;
+            const hasTools = Array.isArray(tools) && tools.length > 0;
+
+            if (hasTools) {
+              console.log(
+                `[ClawRouter] Tools detected (${tools.length}), agentic mode via keywords`,
+              );
+            }
+
+            routingDecision = route(prompt, systemPrompt, maxTokens, {
+              ...routerOpts,
+              routingProfile: routingProfile ?? undefined,
+            });
+
+            // Replace model in body
+            parsed.model = routingDecision.model;
+            modelId = routingDecision.model;
+            bodyModified = true;
+
+            // Pin this model to the session for future requests
+            if (sessionId) {
+              sessionStore.setSession(sessionId, routingDecision.model, routingDecision.tier);
+              console.log(
+                `[ClawRouter] Session ${sessionId.slice(0, 8)}... pinned to model: ${routingDecision.model}`,
+              );
+            }
+
+            options.onRouted?.(routingDecision);
           }
-          const systemMsg = messages?.find((m: ChatMessage) => m.role === "system");
-          const prompt = typeof lastUserMsg?.content === "string" ? lastUserMsg.content : "";
-          const systemPrompt =
-            typeof systemMsg?.content === "string" ? systemMsg.content : undefined;
-
-          // Tool detection no longer forces agentic mode
-          // Agentic mode is now triggered by keyword-based detection (agenticScore >= 0.6)
-          // This allows simple queries with tools to use cheaper models
-          const tools = parsed.tools as unknown[] | undefined;
-          const hasTools = Array.isArray(tools) && tools.length > 0;
-
-          if (hasTools) {
-            console.log(`[ClawRouter] Tools detected (${tools.length}), agentic mode via keywords`);
-          }
-
-          routingDecision = route(prompt, systemPrompt, maxTokens, routerOpts);
-
-          // Replace model in body
-          parsed.model = routingDecision.model;
-          modelId = routingDecision.model;
-          bodyModified = true;
-
-          // Pin this model to the session for future requests
-          if (sessionId) {
-            sessionStore.setSession(sessionId, routingDecision.model, routingDecision.tier);
-            console.log(
-              `[ClawRouter] Session ${sessionId.slice(0, 8)}... pinned to model: ${routingDecision.model}`,
-            );
-          }
-
-          options.onRouted?.(routingDecision);
         }
       }
 
@@ -1345,6 +1428,64 @@ async function proxyRequest(
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error(`[ClawRouter] Routing error: ${errorMsg}`);
       options.onError?.(new Error(`Routing failed: ${errorMsg}`));
+    }
+  }
+
+  // --- Auto-compression ---
+  // Compress large requests to reduce network usage and improve performance
+  const autoCompress = options.autoCompressRequests ?? true;
+  const compressionThreshold = options.compressionThresholdKB ?? 180;
+  const requestSizeKB = Math.ceil(body.length / 1024);
+
+  if (autoCompress && requestSizeKB > compressionThreshold) {
+    try {
+      console.log(
+        `[ClawRouter] Request size ${requestSizeKB}KB exceeds threshold ${compressionThreshold}KB, applying compression...`,
+      );
+
+      // Parse messages for compression
+      const parsed = JSON.parse(body.toString()) as {
+        messages?: NormalizedMessage[];
+        [key: string]: unknown;
+      };
+
+      if (parsed.messages && parsed.messages.length > 0 && shouldCompress(parsed.messages)) {
+        // Apply compression with conservative settings
+        const compressionResult = await compressContext(parsed.messages, {
+          enabled: true,
+          preserveRaw: false, // Don't need originals in proxy
+          layers: {
+            deduplication: true, // Safe: removes duplicate messages
+            whitespace: true, // Safe: normalizes whitespace
+            dictionary: false, // Disabled: requires model to understand codebook
+            paths: false, // Disabled: requires model to understand path codes
+            jsonCompact: true, // Safe: just removes JSON whitespace
+            observation: false, // Disabled: may lose important context
+            dynamicCodebook: false, // Disabled: requires model to understand codes
+          },
+          dictionary: {
+            maxEntries: 50,
+            minPhraseLength: 15,
+            includeCodebookHeader: false,
+          },
+        });
+
+        const compressedSizeKB = Math.ceil(compressionResult.compressedChars / 1024);
+        const savings = (((requestSizeKB - compressedSizeKB) / requestSizeKB) * 100).toFixed(1);
+
+        console.log(
+          `[ClawRouter] Compressed ${requestSizeKB}KB → ${compressedSizeKB}KB (${savings}% reduction)`,
+        );
+
+        // Update request body with compressed messages
+        parsed.messages = compressionResult.messages;
+        body = Buffer.from(JSON.stringify(parsed));
+      }
+    } catch (err) {
+      // Compression failed - continue with original request
+      console.warn(
+        `[ClawRouter] Compression failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -1607,6 +1748,7 @@ async function proxyRequest(
         routerOpts.modelPricing,
         estimatedInputTokens,
         maxTokens,
+        routingProfile ?? undefined,
       );
       routingDecision = {
         ...routingDecision,
@@ -1902,6 +2044,7 @@ async function proxyRequest(
       routerOpts.modelPricing,
       estimatedInputTokens,
       maxTokens,
+      routingProfile ?? undefined,
     );
     // Apply 20% buffer to match x402 pre-auth
     const costWithBuffer = accurateCosts.costEstimate * 1.2;
